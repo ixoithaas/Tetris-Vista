@@ -1,0 +1,5 @@
+{
+  "name": "Tetris Drag",
+  "description": "A browser-based Tetris-style game where blocks are moved by clicking and dragging with the mouse.",
+  "requestFramePermissions": ["gamepad"]
+}
