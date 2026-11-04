@@ -25,6 +25,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The site was originally created as a "deploy from a branch" (legacy) site, which
+      # publishes the repo source and overwrites any Actions deployment. Flip it to
+      # GitHub Actions as the source. Idempotent: a no-op once the source is workflow,
+      # and it self-heals if the setting is ever switched back. GITHUB_TOKEN can do this
+      # because the workflow declares `pages: write` above.
+      - name: Use GitHub Actions as the Pages source
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          build_type=$(gh api repos/{owner}/{repo}/pages --jq .build_type || echo unknown)
+          echo "Current Pages build_type: $build_type"
+          if [ "$build_type" != "workflow" ]; then
+            gh api -X PUT repos/{owner}/{repo}/pages -f build_type=workflow
+            echo "Switched Pages source to GitHub Actions."
+          else
+            echo "Already using GitHub Actions; nothing to do."
+          fi
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
