@@ -31,16 +31,34 @@ jobs:
       # and it self-heals if the setting is ever switched back. GITHUB_TOKEN can do this
       # because the workflow declares `pages: write` above.
       - name: Use GitHub Actions as the Pages source
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          build_type=$(gh api repos/{owner}/{repo}/pages --jq .build_type || echo unknown)
-          echo "Current Pages build_type: $build_type"
-          if [ "$build_type" != "workflow" ]; then
-            gh api -X PUT repos/{owner}/{repo}/pages -f build_type=workflow
-            echo "Switched Pages source to GitHub Actions."
+          set +e
+          REPO="${{ github.repository }}"
+          AUTH="Authorization: Bearer $GH_TOKEN"
+
+          echo "Current build_type: $(gh api "repos/$REPO/pages" --jq .build_type)"
+
+          # Read-only-ish probe: does GITHUB_TOKEN have pages:write at all?
+          probe=$(curl -s -o /tmp/probe.json -w '%{http_code}' -X POST -H "$AUTH" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/$REPO/pages/builds" -d '{}')
+          echo "PROBE POST /pages/builds -> HTTP $probe $(cat /tmp/probe.json)"
+
+          # The real fix, as JSON (gh api -f sends form-encoded, which this endpoint
+          # may reject), and surfaced as an annotation because runner logs are not
+          # reachable from the sandbox.
+          code=$(curl -s -o /tmp/put.json -w '%{http_code}' -X PUT -H "$AUTH" \
+            -H 'Accept: application/vnd.github+json' -H 'Content-Type: application/json' \
+            "https://api.github.com/repos/$REPO/pages" -d '{"build_type":"workflow"}')
+          body=$(cat /tmp/put.json)
+          echo "PUT /pages -> HTTP $code $body"
+          if [ "$code" != "200" ] && [ "$code" != "204" ]; then
+            echo "::error::Pages source flip failed: HTTP $code $body | pages:write probe was HTTP $probe"
           else
-            echo "Already using GitHub Actions; nothing to do."
+            echo "::notice::Pages source switched to GitHub Actions (HTTP $code)"
           fi
 
       - name: Setup Node
