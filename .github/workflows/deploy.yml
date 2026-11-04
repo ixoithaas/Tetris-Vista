@@ -30,37 +30,6 @@ jobs:
       # GitHub Actions as the source. Idempotent: a no-op once the source is workflow,
       # and it self-heals if the setting is ever switched back. GITHUB_TOKEN can do this
       # because the workflow declares `pages: write` above.
-      - name: Use GitHub Actions as the Pages source
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set +e
-          REPO="${{ github.repository }}"
-          AUTH="Authorization: Bearer $GH_TOKEN"
-
-          echo "Current build_type: $(gh api "repos/$REPO/pages" --jq .build_type)"
-
-          # Read-only-ish probe: does GITHUB_TOKEN have pages:write at all?
-          probe=$(curl -s -o /tmp/probe.json -w '%{http_code}' -X POST -H "$AUTH" \
-            -H 'Accept: application/vnd.github+json' \
-            "https://api.github.com/repos/$REPO/pages/builds" -d '{}')
-          echo "PROBE POST /pages/builds -> HTTP $probe $(cat /tmp/probe.json)"
-
-          # The real fix, as JSON (gh api -f sends form-encoded, which this endpoint
-          # may reject), and surfaced as an annotation because runner logs are not
-          # reachable from the sandbox.
-          code=$(curl -s -o /tmp/put.json -w '%{http_code}' -X PUT -H "$AUTH" \
-            -H 'Accept: application/vnd.github+json' -H 'Content-Type: application/json' \
-            "https://api.github.com/repos/$REPO/pages" -d '{"build_type":"workflow"}')
-          body=$(cat /tmp/put.json)
-          echo "PUT /pages -> HTTP $code $body"
-          if [ "$code" != "200" ] && [ "$code" != "204" ]; then
-            echo "::error::Pages source flip failed: HTTP $code $body | pages:write probe was HTTP $probe"
-          else
-            echo "::notice::Pages source switched to GitHub Actions (HTTP $code)"
-          fi
-
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -93,6 +62,37 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      # The Pages source is still "deploy from a branch" (main), so every push also
+      # triggers the legacy branch build, which republishes the raw repo source and
+      # lands ~40s after this deployment - that is what kept the page blank. The source
+      # cannot be changed from here: PUT /repos/{owner}/{repo}/pages returns 403 for both
+      # an org token and this workflow's GITHUB_TOKEN (needs "Pages: write" on a
+      # fine-grained token / repo admin). Until the source is switched to GitHub Actions
+      # in Settings -> Pages, wait for the legacy build of this same commit to settle so
+      # this deployment is the last one to publish. Self-disabling: it exits immediately
+      # once the source reads "workflow", and it only ever issues GETs.
+      - name: Wait for the legacy branch build to settle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO="${{ github.repository }}"
+          build_type=$(gh api "repos/$REPO/pages" --jq .build_type)
+          if [ "$build_type" = "workflow" ]; then
+            echo "Pages source is GitHub Actions; nothing to wait for."
+            exit 0
+          fi
+          echo "Pages source is still a branch; waiting for its build of $GITHUB_SHA."
+          for i in $(seq 1 24); do
+            line=$(gh api "repos/$REPO/pages/builds/latest" --jq '.commit + " " + .status')
+            echo "attempt $i: $line"
+            case "$line" in
+              "$GITHUB_SHA building") ;;
+              "$GITHUB_SHA "*) echo "Legacy build for this commit has settled."; exit 0 ;;
+            esac
+            sleep 10
+          done
+          echo "::warning::Timed out waiting for the legacy Pages build; deploying anyway."
+
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
