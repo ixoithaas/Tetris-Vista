@@ -25,11 +25,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # The site was originally created as a "deploy from a branch" (legacy) site, which
-      # publishes the repo source and overwrites any Actions deployment. Flip it to
-      # GitHub Actions as the source. Idempotent: a no-op once the source is workflow,
-      # and it self-heals if the setting is ever switched back. GITHUB_TOKEN can do this
-      # because the workflow declares `pages: write` above.
+      # NOTE: the Pages *source* setting ("Deploy from a branch" vs "GitHub Actions")
+      # cannot be changed by this workflow. PUT /repos/{owner}/{repo}/pages returns 403
+      # for this repo's token even though `pages: write` is declared above - the setting
+      # needs repo admin. Switching it is a one-time manual step in Settings -> Pages.
+      # The `deploy` job below works around the leftover legacy source; see the comment
+      # there before changing this workflow.
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -62,15 +63,22 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      # The Pages source is still "deploy from a branch" (main), so every push also
-      # triggers the legacy branch build, which republishes the raw repo source and
-      # lands ~40s after this deployment - that is what kept the page blank. The source
-      # cannot be changed from here: PUT /repos/{owner}/{repo}/pages returns 403 for both
-      # an org token and this workflow's GITHUB_TOKEN (needs "Pages: write" on a
-      # fine-grained token / repo admin). Until the source is switched to GitHub Actions
-      # in Settings -> Pages, wait for the legacy build of this same commit to settle so
-      # this deployment is the last one to publish. Self-disabling: it exits immediately
-      # once the source reads "workflow", and it only ever issues GETs.
+      # Why this step exists: the Pages source is "Deploy from a branch" (main), so every
+      # push to main triggers *two* publishers - this Actions deployment, and a legacy
+      # build that publishes the raw repo source (root index.html loading /src/main.tsx,
+      # which a browser cannot execute). Whichever publishes last wins, and when the
+      # legacy build won the site went blank. That is what the user saw.
+      #
+      # So: wait until the legacy build for *this* commit has settled, then deploy, so
+      # this deployment is the last writer. Note it also waits correctly when the legacy
+      # build has not even started yet (latest still points at the previous commit), and
+      # it exits immediately once the source reads "workflow".
+      #
+      # Switching the source to GitHub Actions in Settings -> Pages makes this a no-op
+      # and removes the race permanently; it cannot be done from here (403, see above).
+      # Residual risk: a legacy rebuild starting more than ~4 min after this job would
+      # still overwrite us. That only happens if the source stays legacy *and* Actions
+      # queueing is pathologically slow.
       - name: Wait for the legacy branch build to settle
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
