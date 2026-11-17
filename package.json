@@ -8,7 +8,10 @@
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test:ai": "tsx scripts/engine-check.ts && tsx scripts/game-rules-check.ts && tsx scripts/planner-check.ts && tsx scripts/ai-bench.ts",
+    "bench:ai": "tsx scripts/scorecard.ts",
+    "sweep:ai": "tsx scripts/sweep.ts"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",

@@ -1,6 +1,20 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { Play, RotateCcw, Settings, X, Download, Upload } from 'lucide-react';
 import { calculateGarbage } from './attackTable';
+import {
+  boardToRows,
+  simulate as aiSimulate,
+} from './ai/engine';
+import {
+  Difficulty,
+  DIFFICULTIES,
+  DIFFICULTY_LABELS,
+  OPENER_NAMES,
+  OpenerGoal,
+  chooseOpener,
+  decide as aiDecide,
+} from './ai/strategy';
+import type { Plan } from './ai/planner';
 
 const COLS = 10;
 const ROWS = 20;
@@ -105,115 +119,6 @@ const rotateMatrix = (matrix: number[][], dir: number) => {
   }
   return matrix;
 };
-
-function evaluateBoard(board: number[][], difficulty: 'easy' | 'medium' | 'hard') {
-  let aggregateHeight = 0;
-  let holes = 0;
-  let bumpiness = 0;
-  let maxHeight = 0;
-  let coveredCells = 0;
-  
-  const heights = new Array(COLS).fill(0);
-  
-  for (let x = 0; x < COLS; x++) {
-    let blockSeen = false;
-    let colHoles = 0;
-    for (let y = 0; y < ROWS; y++) {
-      if (board[y][x] !== 0) {
-        if (!blockSeen) {
-          heights[x] = ROWS - y;
-          maxHeight = Math.max(maxHeight, heights[x]);
-          blockSeen = true;
-        }
-      } else {
-        if (blockSeen) {
-          colHoles++;
-          holes++;
-        }
-      }
-    }
-    if (colHoles > 0) {
-      // The number of blocks covering the holes in this column
-      let blocksAboveHoles = heights[x] - colHoles;
-      coveredCells += blocksAboveHoles;
-    }
-  }
-
-  let highestWellDepth = 0;
-  
-  for (let x = 0; x < COLS; x++) {
-    aggregateHeight += heights[x];
-    
-    if (x < COLS - 1) {
-      bumpiness += Math.abs(heights[x] - heights[x + 1]);
-    }
-  }
-  
-  if (difficulty === 'easy') {
-    return -0.8 * aggregateHeight - 0.1 * holes;
-  }
-  
-  if (difficulty === 'medium') {
-    return -0.510066 * aggregateHeight - 0.35663 * holes - 0.184483 * bumpiness;
-  }
-  
-  // 'hard' difficulty
-  
-  let score = 0;
-  score -= aggregateHeight * 5;
-  score -= holes * 3500; // Increased penalization for bad building causing holes
-  score -= coveredCells * 400; // Increased penalization for placing things over holes making them inaccessible
-  score -= bumpiness * 20;
-  
-  let maxH = 0;
-  let minH = ROWS;
-  for (let x = 0; x < COLS; x++) {
-      if (heights[x] > maxH) maxH = heights[x];
-      // Exclude edge wells from minH calculation if they are intentionally deep
-      if ((x === 0 || x === COLS - 1) && heights[x] < minH) {
-          // Check if it's a valid well
-          let isWell = true;
-          if (x===0 && heights[1] <= heights[0]) isWell = false;
-          if (x===COLS-1 && heights[COLS-2] <= heights[COLS-1]) isWell = false;
-          if (!isWell) minH = Math.min(minH, heights[x]);
-      } else {
-          minH = Math.min(minH, heights[x]);
-      }
-      
-      let leftHeight = x === 0 ? ROWS : heights[x - 1];
-      let rightHeight = x === COLS - 1 ? ROWS : heights[x + 1];
-      if (leftHeight > heights[x] && rightHeight > heights[x]) {
-         let depth = Math.min(leftHeight, rightHeight) - heights[x];
-         if (x === 0 || x === COLS - 1) {
-            // Only reward edge wells for tetrises
-            highestWellDepth = Math.max(highestWellDepth, depth);
-         } else {
-            if (depth >= 3) {
-               // Highly penalize I-dependencies / 2-wide dependencies in the middle of the board
-               score -= depth * 800; // Drastic penalty for deep internal dependencies
-            } else {
-               // Normal bumpiness penalty for middle holes
-               score -= depth * 40;
-            }
-         }
-      }
-  }
-
-  // Punish an uneven board (discounting intentional edge well)
-  if (maxH - minH > 4) {
-      score -= (maxH - minH) * 15 * (maxH / 10);
-  }
-  
-  if (maxHeight > 12) {
-     score -= Math.pow(maxHeight - 12, 2) * 50; 
-  }
-
-  if (highestWellDepth >= 3) {
-     score += highestWellDepth * 60; // Strongly reward deep well for Tetrises
-  }
-
-  return score;
-}
 
 let audioCtx: AudioContext | null = null;
 const getAudioCtx = () => {
@@ -330,6 +235,14 @@ const checkPerfectClear = (board: number[][]) => {
   return true;
 };
 
+/**
+ * The board-space T-spin rule (three-corner rule + mini detection).
+ *
+ * This reads the *cleared* board, so any material this piece placed is gone and
+ * the corners can only be seen for rows that survived the clear. The renderer and
+ * the AI therefore also record the rule result at lock time, when the board still
+ * contains the piece; `spinAtLock` is preferred whenever it is available.
+ */
 const getSpinType = (
   board: number[][],
   piece: { typeId: number, x: number, y: number, rotationState: number },
@@ -337,7 +250,7 @@ const getSpinType = (
 ): 'normal' | 'mini' | null => {
   if (!lastMove || lastMove.type !== 'rotate') return null;
 
-  if (piece.typeId === 6) { // T piece
+  if (piece.typeId === 6) {
     const corners = [
       { x: piece.x, y: piece.y },         // Top-left
       { x: piece.x + 2, y: piece.y },     // Top-right
@@ -347,7 +260,8 @@ const getSpinType = (
 
     let occupiedCorners = 0;
     const occupied = corners.map(c => {
-      const isOccupied = c.y < 0 || c.y >= ROWS || c.x < 0 || c.x >= COLS || board[c.y][c.x] !== 0;
+      const isOccupied =
+        c.y < 0 || c.y >= ROWS || c.x < 0 || c.x >= COLS || board[c.y][c.x] !== 0;
       if (isOccupied) occupiedCorners++;
       return isOccupied;
     });
@@ -372,10 +286,6 @@ const getSpinType = (
     if (lastMove.kickIndex === 4) return 'normal';
     if (frontCornersOccupied === 2) return 'normal';
     return 'mini';
-  } else if ([1, 2, 3, 5, 7].includes(piece.typeId)) { // I, J, L, S, Z pieces
-    if (lastMove.kickIndex && lastMove.kickIndex > 0) {
-      return 'normal';
-    }
   }
   return null;
 };
@@ -399,7 +309,7 @@ export default function App() {
   const aiPpsRef = useRef(aiPps);
   useEffect(() => { aiPpsRef.current = aiPps; }, [aiPps]);
   
-  const [aiDifficulty, setAiDifficulty] = useState<'easy' | 'medium' | 'hard'>('medium');
+  const [aiDifficulty, setAiDifficulty] = useState<Difficulty>('medium');
   const aiDifficultyRef = useRef(aiDifficulty);
   useEffect(() => { aiDifficultyRef.current = aiDifficulty; }, [aiDifficulty]);
   
@@ -439,10 +349,12 @@ export default function App() {
   const p1ComboRef = useRef<number>(-1);
   const p1B2bCounterRef = useRef<number>(0);
   const p1LastMoveRef = useRef<{ type: 'move' | 'rotate' | 'drop' | 'hardDrop', kickIndex?: number } | null>(null);
+  const p1SpinAtLockRef = useRef<'normal' | 'mini' | null>(null);
   
   const aiComboRef = useRef<number>(-1);
   const aiB2bCounterRef = useRef<number>(0);
   const aiLastMoveRef = useRef<{ type: 'move' | 'rotate' | 'drop' | 'hardDrop', kickIndex?: number } | null>(null);
+  const aiSpinAtLockRef = useRef<'normal' | 'mini' | null>(null);
   
   const p1ClearingLinesRef = useRef<{ y: number, blocks: number[], timer: number }[]>([]);
   const aiClearingLinesRef = useRef<{ y: number, blocks: number[], timer: number }[]>([]);
@@ -450,6 +362,24 @@ export default function App() {
   const aiDropCounterRef = useRef<number>(0);
   const aiTargetRef = useRef<{x: number, y: number, rotation: number, lastMove: any} | null>(null);
   const aiTimerRef = useRef(0);
+
+  // ---- AI brain state (shared by both boards) ------------------------------
+  const [aiHold, setAiHold] = useState<number | null>(null);
+  const aiHoldRef = useRef<number | null>(null);
+  const aiCanHoldRef = useRef(true);
+  const p1CanHoldRef = useRef(true);
+  const p1PlanRef = useRef<Plan | null>(null);
+  const aiPlanRef = useRef<Plan | null>(null);
+  const p1OpenerRef = useRef<OpenerGoal | null>(null);
+  const aiOpenerRef = useRef<OpenerGoal | null>(null);
+  const p1PiecesPlacedRef = useRef(0);
+  const aiPiecesPlacedRef = useRef(0);
+  // The I-well each brain is currently building around (-1 = none chosen yet).
+  const p1WellColumnRef = useRef(-1);
+  const aiWellColumnRef = useRef(-1);
+  const [aiStrategy, setAiStrategy] = useState<{ label: string; detail: string } | null>(null);
+  const aiStrategyRef = useRef<{ label: string; detail: string } | null>(null);
+  const aiDecisionIdRef = useRef(0);
   
   const [heldPiece, setHeldPiece] = useState<number | null>(null);
   const [hasHeld, setHasHeld] = useState(false);
@@ -511,257 +441,6 @@ export default function App() {
     });
   }, []);
 
-  const calculateBestMove = useCallback((board: number[][], piece: any, nextPieceTypeId: number, difficulty: 'easy' | 'medium' | 'hard', currentB2B: number = 0, currentCombo: number = -1) => {
-    let bestScore = -Infinity;
-    let bestMove = null;
-
-    interface State {
-      x: number;
-      y: number;
-      r: number;
-      lastMove: { type: 'move' | 'rotate' | 'drop' | 'hardDrop', kickIndex?: number } | null;
-    }
-
-    const getValidPlacements = (simBoard: number[][], pieceTypeId: number, startX: number, startY: number, startR: number) => {
-      const queue: State[] = [{ x: startX, y: startY, r: startR, lastMove: null }];
-      const visited = new Set<string>();
-      visited.add(`${startX},${startY},${startR}`);
-      const placements: State[] = [];
-
-      const checkCollision = (x: number, y: number, r: number) => {
-        let matrix = SHAPES[pieceTypeId];
-        for (let i = 0; i < r; i++) matrix = rotateMatrix(matrix, 1);
-        return collide(simBoard, { matrix, x, y });
-      };
-
-      if (checkCollision(startX, startY, startR)) return [];
-
-      let head = 0;
-      while (head < queue.length) {
-        const curr = queue[head++];
-
-        if (checkCollision(curr.x, curr.y + 1, curr.r)) {
-          placements.push(curr);
-        }
-
-        // Down
-        if (!checkCollision(curr.x, curr.y + 1, curr.r)) {
-          const key = `${curr.x},${curr.y + 1},${curr.r}`;
-          if (!visited.has(key)) {
-            visited.add(key);
-            queue.push({ x: curr.x, y: curr.y + 1, r: curr.r, lastMove: { type: 'drop' } });
-          }
-        }
-        // Left
-        if (!checkCollision(curr.x - 1, curr.y, curr.r)) {
-          const key = `${curr.x - 1},${curr.y},${curr.r}`;
-          if (!visited.has(key)) {
-            visited.add(key);
-            queue.push({ x: curr.x - 1, y: curr.y, r: curr.r, lastMove: { type: 'move' } });
-          }
-        }
-        // Right
-        if (!checkCollision(curr.x + 1, curr.y, curr.r)) {
-          const key = `${curr.x + 1},${curr.y},${curr.r}`;
-          if (!visited.has(key)) {
-            visited.add(key);
-            queue.push({ x: curr.x + 1, y: curr.y, r: curr.r, lastMove: { type: 'move' } });
-          }
-        }
-        // Rotate CW & CCW
-        if (pieceTypeId !== 4) {
-          for (const dir of [1, -1]) {
-            const nextR = (curr.r + (dir === 1 ? 1 : 3)) % 4;
-            const transition = `${curr.r}->${nextR}`;
-            const kickData = pieceTypeId === 1 ? KICK_DATA_I[transition] : KICK_DATA_JLSTZ[transition];
-            
-            for (let i = 0; i < kickData.length; i++) {
-              const kick = kickData[i];
-              const nx = curr.x + kick.x;
-              const ny = curr.y - kick.y;
-              if (!checkCollision(nx, ny, nextR)) {
-                const key = `${nx},${ny},${nextR}`;
-                if (!visited.has(key)) {
-                  visited.add(key);
-                  queue.push({ x: nx, y: ny, r: nextR, lastMove: { type: 'rotate', kickIndex: i } });
-                }
-                break;
-              }
-            }
-          }
-        }
-      }
-      return placements;
-    };
-
-    const placements = getValidPlacements(board, piece.typeId, piece.x, piece.y, piece.rotationState);
-
-    for (const p of placements) {
-      let matrix = SHAPES[piece.typeId];
-      for(let i=0; i<p.r; i++) matrix = rotateMatrix(matrix, 1);
-      const testPiece = { matrix, x: p.x, y: p.y, typeId: piece.typeId, rotationState: p.r };
-      
-      const newBoard = board.map(row => [...row]);
-      testPiece.matrix.forEach((row: number[], y: number) => {
-        row.forEach((value: number, px: number) => {
-          if (value !== 0 && newBoard[y + testPiece.y]) {
-            newBoard[y + testPiece.y][px + testPiece.x] = value;
-          }
-        });
-      });
-
-      let linesCleared = 0;
-      const simBoard = newBoard.map(row => [...row]);
-      for (let y = ROWS - 1; y >= 0; y--) {
-        if (simBoard[y].every(cell => cell !== 0)) {
-          simBoard.splice(y, 1);
-          simBoard.unshift(new Array(COLS).fill(0));
-          linesCleared++;
-          y++;
-        }
-      }
-
-      const spinType = getSpinType(board, testPiece, p.lastMove);
-      const isPerfectClear = checkPerfectClear(simBoard);
-      
-      let nextB2B = currentB2B;
-      let nextCombo = linesCleared > 0 ? (currentCombo >= 0 ? currentCombo + 1 : 0) : -1;
-      
-      if (linesCleared === 4 || spinType !== null) {
-        nextB2B++;
-      } else if (linesCleared > 0) {
-        nextB2B = 0;
-      }
-      
-      const garbage = calculateGarbage(linesCleared, spinType, nextB2B > 1 ? nextB2B : 0, Math.max(0, nextCombo), isPerfectClear);
-
-      let maxSimHeight = 0;
-      for (let x = 0; x < COLS; x++) {
-        for (let y = 0; y < ROWS; y++) {
-          if (simBoard[y][x] !== 0) {
-            maxSimHeight = Math.max(maxSimHeight, ROWS - y);
-            break;
-          }
-        }
-      }
-
-      let score = evaluateBoard(simBoard, difficulty);
-      
-      if (difficulty === 'hard') {
-        let moveValue = garbage * 1000;
-        if (isPerfectClear) moveValue += 100000;
-        
-        if (linesCleared > 0 && garbage <= 1 && spinType === null && linesCleared < 4) {
-           // Weak clears (single/double without spin)
-           let penalty = linesCleared * 1000;
-           if (maxSimHeight >= 14) {
-              penalty = 0; // Panic mode: allow any clears for survival when high
-           } else if (maxSimHeight >= 10) {
-              penalty *= 0.5; // Reduced penalty when moderately high
-           }
-           moveValue -= penalty; // Penalize weak clears to promote setups
-        }
-        if (spinType && linesCleared === 0) {
-           moveValue += 1000; // Reward achieving a spin placement for setups strongly
-        }
-        
-        score += moveValue;
-      }
-
-      if (difficulty === 'hard' && nextPieceTypeId) {
-        const nextStartX = Math.floor(COLS / 2) - Math.floor(SHAPES[nextPieceTypeId][0].length / 2);
-        const nextPlacements = getValidPlacements(simBoard, nextPieceTypeId, nextStartX, 0, 0);
-        
-        let bestNextScore = -Infinity;
-        for (const np of nextPlacements) {
-          let nMatrix = SHAPES[nextPieceTypeId];
-          for(let i=0; i<np.r; i++) nMatrix = rotateMatrix(nMatrix, 1);
-          const nTestPiece = { matrix: nMatrix, x: np.x, y: np.y, typeId: nextPieceTypeId, rotationState: np.r };
-          
-          const nBoard = simBoard.map(row => [...row]);
-          nTestPiece.matrix.forEach((row: number[], y: number) => {
-            row.forEach((value: number, px: number) => {
-              if (value !== 0 && nBoard[y + nTestPiece.y]) {
-                nBoard[y + nTestPiece.y][px + nTestPiece.x] = value;
-              }
-            });
-          });
-
-          let nLinesCleared = 0;
-          const nSimBoard = nBoard.map(row => [...row]);
-          for (let y = ROWS - 1; y >= 0; y--) {
-            if (nSimBoard[y].every(cell => cell !== 0)) {
-              nSimBoard.splice(y, 1);
-              nSimBoard.unshift(new Array(COLS).fill(0));
-              nLinesCleared++;
-              y++;
-            }
-          }
-
-          const nSpinType = getSpinType(simBoard, nTestPiece, np.lastMove);
-          const nIsPerfectClear = checkPerfectClear(nSimBoard);
-          
-          let finalB2B = nextB2B;
-          let finalCombo = nLinesCleared > 0 ? (nextCombo >= 0 ? nextCombo + 1 : 0) : -1;
-          
-          if (nLinesCleared === 4 || nSpinType !== null) {
-            finalB2B++;
-          } else if (nLinesCleared > 0) {
-            finalB2B = 0;
-          }
-          
-          const nGarbage = calculateGarbage(nLinesCleared, nSpinType, finalB2B > 1 ? finalB2B : 0, Math.max(0, finalCombo), nIsPerfectClear);
-
-          let nMaxSimHeight = 0;
-          for (let x = 0; x < COLS; x++) {
-            for (let y = 0; y < ROWS; y++) {
-              if (nSimBoard[y][x] !== 0) {
-                nMaxSimHeight = Math.max(nMaxSimHeight, ROWS - y);
-                break;
-              }
-            }
-          }
-
-          let nScore = evaluateBoard(nSimBoard, difficulty);
-          
-          if (difficulty === 'hard') {
-             let nMoveValue = nGarbage * 1000;
-             if (nIsPerfectClear) nMoveValue += 100000;
-             if (nLinesCleared > 0 && nGarbage <= 1 && nSpinType === null && nLinesCleared < 4) {
-                let penalty = nLinesCleared * 1000;
-                if (nMaxSimHeight >= 14) {
-                   penalty = 0; // Panic mode
-                } else if (nMaxSimHeight >= 10) {
-                   penalty *= 0.5;
-                }
-                nMoveValue -= penalty;
-             }
-             if (nSpinType && nLinesCleared === 0) nMoveValue += 1000;
-             if (nIsPerfectClear) nMoveValue += 100000;
-             
-             nScore += nMoveValue;
-          }
-
-          if (nScore > bestNextScore) bestNextScore = nScore;
-        }
-        score = bestNextScore !== -Infinity ? score + bestNextScore * 0.5 : score;
-      }
-      
-      if (score > bestScore) {
-        bestScore = score;
-        bestMove = { x: p.x, y: p.y, rotation: p.r, lastMove: p.lastMove };
-      }
-    }
-    return bestMove;
-  }, [collide]);
-
-  useEffect(() => {
-    if (isAiEnabled && isPlaying && pieceRef.current) {
-      p1AiTargetRef.current = calculateBestMove(boardRef.current, pieceRef.current, nextPieces[0], aiDifficulty, p1B2bCounterRef.current, p1ComboRef.current);
-    } else {
-      p1AiTargetRef.current = null;
-    }
-  }, [isAiEnabled, isPlaying, calculateBestMove, nextPieces, aiDifficulty]);
 
   const drawMatrix = useCallback((matrix: number[][], offset: {x: number, y: number}, ctx: CanvasRenderingContext2D, isGhost: boolean | 'ai' = false) => {
     matrix.forEach((row, y) => {
@@ -1000,7 +679,8 @@ export default function App() {
       
       p1ComboRef.current++;
       
-      const tSpinType = pieceRef.current ? getSpinType(boardRef.current, pieceRef.current, p1LastMoveRef.current) : null;
+      const tSpinType = p1SpinAtLockRef.current
+        ?? (pieceRef.current ? getSpinType(boardRef.current, pieceRef.current, p1LastMoveRef.current) : null);
       const isB2bClear = linesCleared === 4 || tSpinType !== null;
       
       const isPerfectClear = checkPerfectClear(boardRef.current);
@@ -1078,7 +758,8 @@ export default function App() {
       
       aiComboRef.current++;
       
-      const tSpinType = aiPieceRef.current ? getSpinType(aiBoardRef.current, aiPieceRef.current, aiLastMoveRef.current) : null;
+      const tSpinType = aiSpinAtLockRef.current
+        ?? (aiPieceRef.current ? getSpinType(aiBoardRef.current, aiPieceRef.current, aiLastMoveRef.current) : null);
       const isB2bClear = linesCleared === 4 || tSpinType !== null;
       
       const isPerfectClear = checkPerfectClear(aiBoardRef.current);
@@ -1153,6 +834,99 @@ export default function App() {
     setAiNextPieces([...pieces]);
   }, [getPieceFromSequence]);
 
+  /**
+   * Runs the AI planner for a board and returns the target the piece must reach.
+   *
+   * `side` is 'p1' (the AI autoplaying the player board) or 'ai' (the opponent).
+   * Both use the same engine; they only differ in which state they read.
+   */
+  const planAiMove = useCallback((
+    side: 'p1' | 'ai',
+    board: number[][],
+    pieceType: number,
+    queue: number[],
+    hold: number | null,
+    canHold: boolean,
+    b2b: number,
+    combo: number,
+    incomingGarbage: number,
+    difficulty: Difficulty,
+    plan: Plan | null,
+    piecesPlaced: number,
+    opener: OpenerGoal | null,
+    wellColumn: number,
+  ) => {
+    const decision = aiDecide({
+      board,
+      current: pieceType,
+      queue,
+      hold,
+      canHold,
+      b2b,
+      combo,
+      incomingGarbage,
+      piecesPlaced,
+      opener,
+      difficulty,
+      plan,
+      wellColumn,
+      // Decision time tracks the AI's speed: at 10 PPS there are only 100 ms per
+      // piece, so a heavy search must thin out rather than stutter the frame.
+      timeBudgetMs: Math.max(8, Math.min(45, (1000 / Math.max(0.5, aiPpsRef.current)) * 0.6)),
+    });
+    if (!decision) return null;
+
+    return {
+      side,
+      placement: decision.placement,
+      useHold: decision.useHold,
+      plan: decision.plan,
+      label: decision.label,
+      intent: decision.intent,
+      wellColumn: decision.wellColumn,
+    };
+  }, []);
+
+
+/**
+ * Resolves the exact board position for an AI target.
+ *
+ * The AI works on a flat board model, so its `y` is an absolute board row. The
+ * game spawns pieces at row 0 and applies targets directly, so this recomputes the
+ * resting row from the live board and the target matrix: the AI's intent (column,
+ * rotation) is preserved while the row is guaranteed to be a real resting place.
+ */
+const resolveTargetPosition = (
+  board: number[][],
+  typeId: number,
+  rotation: number,
+  targetX: number,
+) => {
+  let matrix = SHAPES[typeId];
+  for (let i = 0; i < rotation; i++) matrix = rotateMatrix(matrix, 1);
+  const piece = { matrix, x: targetX, y: 0 } as { matrix: number[][]; x: number; y: number };
+
+  const collidesAt = (py: number) => {
+    for (let yy = 0; yy < matrix.length; yy++) {
+      for (let xx = 0; xx < matrix[yy].length; xx++) {
+        if (matrix[yy][xx] === 0) continue;
+        const by = py + yy;
+        const bx = targetX + xx;
+        if (by < 0) continue;
+        if (bx < 0 || bx >= COLS || by >= ROWS) return true;
+        if (board[by] && board[by][bx] !== 0) return true;
+      }
+    }
+    return false;
+  };
+
+  // Start above the board, exactly like a hard drop from the spawn row, so the
+  // result is always the topmost resting place (the same one the AI planned).
+  piece.y = -matrix.length;
+  while (!collidesAt(piece.y + 1)) piece.y++;
+  return { x: targetX, y: piece.y };
+};
+
   const spawnPiece = useCallback((specificTypeId?: number) => {
     if (nextPiecesRef.current.length === 0) {
       initNextPieces();
@@ -1177,6 +951,7 @@ export default function App() {
     };
     
     p1LastMoveRef.current = null;
+    p1SpinAtLockRef.current = null;
     
     lowestYRef.current = pieceRef.current.y;
     lockResetsRef.current = 0;
@@ -1189,20 +964,99 @@ export default function App() {
       setIsPlaying(false);
       playGameOverSound();
     } else {
-      if (isAiEnabledRef.current) {
-        p1AiTargetRef.current = calculateBestMove(boardRef.current, pieceRef.current, nextPiecesRef.current[0], aiDifficultyRef.current, p1B2bCounterRef.current, p1ComboRef.current);
-      }
+      p1AiTargetRef.current = null;
     }
-  }, [collide, initNextPieces, handling.dcd, calculateBestMove, getPieceFromSequence]);
+  }, [collide, initNextPieces, handling.dcd, getPieceFromSequence]);
 
-  const aiSpawnPiece = useCallback(() => {
+  /** Recompute the autopilot target for the piece currently in play (P1). */
+  const planP1Move = useCallback(() => {
+    if (!pieceRef.current) return;
+    const decision = planAiMove(
+      'p1',
+      boardRef.current,
+      pieceRef.current.typeId,
+      nextPiecesRef.current.slice(0, 4),
+      heldPiece,
+      p1CanHoldRef.current,
+      p1B2bCounterRef.current,
+      p1ComboRef.current,
+      p1GarbageQueueRef.current,
+      aiDifficultyRef.current,
+      p1PlanRef.current,
+      p1PiecesPlacedRef.current,
+      p1OpenerRef.current,
+      p1WellColumnRef.current,
+    );
+    if (!decision) {
+      p1AiTargetRef.current = null;
+      return;
+    }
+    p1WellColumnRef.current = decision.wellColumn;
+    p1AiTargetRef.current = {
+      x: decision.placement.x,
+      y: decision.placement.y,
+      rotation: decision.placement.rotation,
+      lastMove: null,
+      spin: decision.placement.spin,
+      useHold: decision.useHold,
+      nextType: nextPiecesRef.current[0],
+    };
+    p1PlanRef.current = decision.plan;
+  }, [planAiMove, heldPiece]);
+
+  /** Recompute the opponent's move for the piece currently in play. */
+  const planAiOpponentMove = useCallback(() => {
+    if (!aiPieceRef.current) return;
+    const decision = planAiMove(
+      'ai',
+      aiBoardRef.current,
+      aiPieceRef.current.typeId,
+      aiNextPiecesRef.current.slice(0, 4),
+      aiHoldRef.current,
+      aiCanHoldRef.current,
+      aiB2bCounterRef.current,
+      aiComboRef.current,
+      aiGarbageQueueRef.current,
+      aiDifficultyRef.current,
+      aiPlanRef.current,
+      aiPiecesPlacedRef.current,
+      aiOpenerRef.current,
+      aiWellColumnRef.current,
+    );
+    if (!decision) {
+      aiTargetRef.current = null;
+      return;
+    }
+    aiWellColumnRef.current = decision.wellColumn;
+    aiTargetRef.current = {
+      x: decision.placement.x,
+      y: decision.placement.y,
+      rotation: decision.placement.rotation,
+      lastMove: null,
+      spin: decision.placement.spin,
+      useHold: decision.useHold,
+    };
+    aiPlanRef.current = decision.plan;
+    aiStrategyRef.current = {
+      label: decision.label || decision.intent,
+      detail: aiDifficultyRef.current,
+    };
+    setAiStrategy(aiStrategyRef.current);
+  }, [planAiMove]);
+
+  const aiSpawnPiece = useCallback((specificTypeId?: number) => {
     if (aiNextPiecesRef.current.length === 0) {
       aiInitNextPieces();
     }
-    
-    const typeId = aiNextPiecesRef.current.shift()!;
-    aiNextPiecesRef.current.push(getPieceFromSequence(aiPieceIndexRef.current++));
-    setAiNextPieces([...aiNextPiecesRef.current]);
+
+    let typeId: number;
+    if (specificTypeId !== undefined) {
+      typeId = specificTypeId;
+    } else {
+      typeId = aiNextPiecesRef.current.shift()!;
+      aiNextPiecesRef.current.push(getPieceFromSequence(aiPieceIndexRef.current++));
+      setAiNextPieces([...aiNextPiecesRef.current]);
+    }
 
     const matrix = SHAPES[typeId];
     const x = Math.floor(COLS / 2) - Math.floor(matrix[0].length / 2);
@@ -1212,19 +1066,23 @@ export default function App() {
     aiPieceRef.current = piece;
     
     aiLastMoveRef.current = null;
+    aiSpinAtLockRef.current = null;
     
+    aiTargetRef.current = null;
     if (collide(aiBoardRef.current, piece)) {
       setAiGameOver(true);
       aiGameOverRef.current = true;
       setIsPlaying(false);
       playGameOverSound();
-    } else {
-      aiTargetRef.current = calculateBestMove(aiBoardRef.current, aiPieceRef.current, aiNextPiecesRef.current[0], aiDifficultyRef.current, aiB2bCounterRef.current, aiComboRef.current);
     }
-  }, [getPieceFromSequence, aiInitNextPieces, calculateBestMove, collide]);
+  }, [getPieceFromSequence, aiInitNextPieces, collide]);
 
   const lockPiece = useCallback(() => {
     if (!pieceRef.current) return;
+    // Judge the spin before the board changes: after the clear the piece's own
+    // cells are gone, and for a T-spin whose corners came from this piece the
+    // cleared board can no longer prove the spin.
+    p1SpinAtLockRef.current = getSpinType(boardRef.current, pieceRef.current, p1LastMoveRef.current);
     merge(boardRef.current, pieceRef.current);
     sweep();
     
@@ -1235,11 +1093,15 @@ export default function App() {
     }
     
     setHasHeldBoth(false);
+    p1CanHoldRef.current = true;
+    p1PiecesPlacedRef.current++;
+    p1AiTargetRef.current = null;
     spawnPiece();
   }, [merge, sweep, spawnPiece, setHasHeldBoth]);
 
   const aiLockPiece = useCallback(() => {
     if (!aiPieceRef.current) return;
+    aiSpinAtLockRef.current = getSpinType(aiBoardRef.current, aiPieceRef.current, aiLastMoveRef.current);
     merge(aiBoardRef.current, aiPieceRef.current);
     aiSweep();
     
@@ -1248,7 +1110,10 @@ export default function App() {
       aiGarbageQueueRef.current = 0;
       setAiGarbage(0);
     }
-    
+
+    aiCanHoldRef.current = true;
+    aiPiecesPlacedRef.current++;
+    aiTargetRef.current = null;
     aiSpawnPiece();
   }, [merge, aiSweep, aiSpawnPiece]);
 
@@ -1465,15 +1330,35 @@ export default function App() {
 
     if (heldPiece === null) {
       setHeldPiece(currentTypeId);
+      p1CanHoldRef.current = false;
       spawnPiece();
     } else {
       const previousHeld = heldPiece;
       setHeldPiece(currentTypeId);
+      p1CanHoldRef.current = false;
       spawnPiece(previousHeld);
     }
 
     setHasHeldBoth(true);
   }, [heldPiece, spawnPiece, setHasHeldBoth]);
+
+  /** Hold/swap for the opponent board (mirrors playerHold). */
+  const aiHoldPiece = useCallback(() => {
+    if (!aiCanHoldRef.current || !aiPieceRef.current) return;
+    const currentTypeId = aiPieceRef.current.typeId;
+    aiCanHoldRef.current = false;
+
+    if (aiHoldRef.current === null) {
+      aiHoldRef.current = currentTypeId;
+      setAiHold(currentTypeId);
+      aiSpawnPiece();
+    } else {
+      const previousHeld = aiHoldRef.current;
+      aiHoldRef.current = currentTypeId;
+      setAiHold(currentTypeId);
+      aiSpawnPiece(previousHeld);
+    }
+  }, [aiSpawnPiece]);
 
   const pollGamepad = useCallback(() => {
     if (showSettings) return; // Don't process game input while settings are open
@@ -1566,24 +1451,38 @@ export default function App() {
     
     // Player 1 Update
     if (!gameOverRef.current) {
-      if (isAiEnabledRef.current && p1AiTargetRef.current && pieceRef.current) {
-        p1AiTimerRef.current += deltaTime;
-        const delayMs = 1000 / aiPpsRef.current;
-        if (p1AiTimerRef.current > delayMs) {
-          p1AiTimerRef.current -= delayMs;
-          if (p1AiTimerRef.current > delayMs) p1AiTimerRef.current = delayMs; // Cap to prevent infinite growth
-          const target = p1AiTargetRef.current;
-          const piece = pieceRef.current;
-          
-          piece.rotationState = target.rotation;
-          let matrix = SHAPES[piece.typeId];
-          for(let i=0; i<target.rotation; i++) matrix = rotateMatrix(matrix, 1);
-          piece.matrix = matrix;
-          piece.x = target.x;
-          piece.y = target.y;
-          
-          p1LastMoveRef.current = target.lastMove;
-          lockPiece();
+      if (isAiEnabledRef.current && pieceRef.current) {
+        if (!p1AiTargetRef.current) planP1Move();
+        if (p1AiTargetRef.current) {
+          p1AiTimerRef.current += deltaTime;
+          const delayMs = 1000 / aiPpsRef.current;
+          if (p1AiTimerRef.current > delayMs) {
+            p1AiTimerRef.current -= delayMs;
+            if (p1AiTimerRef.current > delayMs) p1AiTimerRef.current = delayMs; // Cap to prevent infinite growth
+            const target = p1AiTargetRef.current;
+            const piece = pieceRef.current;
+
+            if (target.useHold && !hasHeldRef.current) {
+              playerHold();
+              p1AiTargetRef.current = null;
+            } else {
+              piece.rotationState = target.rotation;
+              let matrix = SHAPES[piece.typeId];
+              for (let i = 0; i < target.rotation; i++) matrix = rotateMatrix(matrix, 1);
+              const at = resolveTargetPosition(boardRef.current, piece.typeId, target.rotation, target.x);
+              piece.matrix = matrix;
+              piece.x = at.x;
+              piece.y = at.y;
+
+              // A tuck placement is only reachable with a kick, and the corner
+              // rule still has the final say, so mark it as the 180 kick so a
+              // finished T-spin always registers as 'normal'.
+              p1LastMoveRef.current = target.spin
+                ? { type: 'rotate', kickIndex: 4 }
+                : { type: 'hardDrop' };
+              lockPiece();
+            }
+          }
         }
       } else {
         pollGamepad();
@@ -1641,33 +1540,42 @@ export default function App() {
 
     // AI Update
     if (!aiGameOverRef.current) {
-      if (aiTargetRef.current && aiPieceRef.current) {
-        aiTimerRef.current += deltaTime;
-        const delayMs = 1000 / aiPpsRef.current;
-        if (aiTimerRef.current > delayMs) {
-          aiTimerRef.current -= delayMs;
-          if (aiTimerRef.current > delayMs) aiTimerRef.current = delayMs; // Cap to prevent infinite growth
-          const target = aiTargetRef.current;
-          const piece = aiPieceRef.current;
-          
-          piece.rotationState = target.rotation;
-          let matrix = SHAPES[piece.typeId];
-          for(let i=0; i<target.rotation; i++) matrix = rotateMatrix(matrix, 1);
-          piece.matrix = matrix;
-          piece.x = target.x;
-          piece.y = target.y;
-          
-          aiLastMoveRef.current = target.lastMove;
-          aiLockPiece();
+      if (aiPieceRef.current) {
+        if (!aiTargetRef.current) planAiOpponentMove();
+        if (aiTargetRef.current) {
+          aiTimerRef.current += deltaTime;
+          const delayMs = 1000 / aiPpsRef.current;
+          if (aiTimerRef.current > delayMs) {
+            aiTimerRef.current -= delayMs;
+            if (aiTimerRef.current > delayMs) aiTimerRef.current = delayMs; // Cap to prevent infinite growth
+            const target = aiTargetRef.current;
+            const piece = aiPieceRef.current;
+
+            if (target.useHold && aiCanHoldRef.current) {
+              aiHoldPiece();
+              aiTargetRef.current = null;
+            } else {
+              piece.rotationState = target.rotation;
+              let matrix = SHAPES[piece.typeId];
+              for (let i = 0; i < target.rotation; i++) matrix = rotateMatrix(matrix, 1);
+              const at = resolveTargetPosition(aiBoardRef.current, piece.typeId, target.rotation, target.x);
+              piece.matrix = matrix;
+              piece.x = at.x;
+              piece.y = at.y;
+
+              aiLastMoveRef.current = target.spin
+                ? { type: 'rotate', kickIndex: 4 }
+                : { type: 'hardDrop' };
+              aiLockPiece();
+            }
+          }
         }
-      } else if (aiPieceRef.current) {
-        aiTargetRef.current = calculateBestMove(aiBoardRef.current, aiPieceRef.current, aiNextPiecesRef.current[0], aiDifficultyRef.current, aiB2bCounterRef.current, aiComboRef.current);
       }
     }
     
     draw();
     requestRef.current = requestAnimationFrame(update);
-  }, [draw, playerDrop, pollGamepad, playerMove, playerSoftDropToBottom, handling, lockPiece, collide, playerRotate, playerHardDrop, aiRotate, aiMove, aiHardDrop, aiLockPiece, calculateBestMove]);
+  }, [draw, playerDrop, pollGamepad, playerMove, playerSoftDropToBottom, handling, lockPiece, collide, playerRotate, playerHardDrop, playerHold, aiRotate, aiMove, aiHardDrop, aiLockPiece, aiHoldPiece, planP1Move, planAiOpponentMove]);
 
   const startGame = () => {
     pieceSequenceRef.current = [];
@@ -1687,7 +1595,27 @@ export default function App() {
 
     setHeldPiece(null);
     setHasHeldBoth(false);
-    
+
+    // AI brains
+    p1AiTargetRef.current = null;
+    aiTargetRef.current = null;
+    p1PlanRef.current = null;
+    aiPlanRef.current = null;
+    p1PiecesPlacedRef.current = 0;
+    aiPiecesPlacedRef.current = 0;
+    p1WellColumnRef.current = -1;
+    aiWellColumnRef.current = -1;
+    p1CanHoldRef.current = true;
+    aiCanHoldRef.current = true;
+    aiHoldRef.current = null;
+    setAiHold(null);
+    aiStrategyRef.current = null;
+    setAiStrategy(null);
+
+    // Hard/expert open with a known opener; easy/medium just play.
+    p1OpenerRef.current = chooseOpener(aiDifficultyRef.current);
+    aiOpenerRef.current = chooseOpener(aiDifficultyRef.current);
+
     p1AiTimerRef.current = 0;
     aiTimerRef.current = 0;
     
@@ -2109,13 +2037,45 @@ export default function App() {
                   </div>
                   <select 
                     value={aiDifficulty} 
-                    onChange={e => setAiDifficulty(e.target.value as any)}
+                    onChange={e => {
+                      const next = e.target.value as Difficulty;
+                      setAiDifficulty(next);
+                      // Restart the opener repertoire for the new level.
+                      p1OpenerRef.current = chooseOpener(next);
+                      aiOpenerRef.current = chooseOpener(next);
+                      p1PlanRef.current = null;
+                      aiPlanRef.current = null;
+                      p1AiTargetRef.current = null;
+                      aiTargetRef.current = null;
+                      p1WellColumnRef.current = -1;
+                      aiWellColumnRef.current = -1;
+                    }}
                     className="w-full bg-slate-800 text-white border border-slate-700 rounded-lg p-1.5 text-sm outline-none focus:border-cyan-500"
                   >
-                    <option value="easy">Easy</option>
-                    <option value="medium">Medium</option>
-                    <option value="hard">Hard</option>
+                    {DIFFICULTIES.map(d => (
+                      <option key={d} value={d}>{DIFFICULTY_LABELS[d]}</option>
+                    ))}
                   </select>
+                  <p className="text-[11px] leading-snug text-slate-500 mt-2">
+                    {aiDifficulty === 'easy' && 'Casual but tidy: flat stack, grinds singles and doubles.'}
+                    {aiDifficulty === 'medium' && 'Solid ladder play: keeps an I-well, tetrises on purpose.'}
+                    {aiDifficulty === 'hard' && 'Openers, T-spins, tetrises and all clears, two moves ahead.'}
+                    {aiDifficulty === 'expert' && 'Three moves ahead: T-spin triples, deep all-clear hunting.'}
+                  </p>
+                  {(aiDifficulty === 'hard' || aiDifficulty === 'expert') && (
+                    <p className="text-[11px] leading-snug text-slate-600 mt-1">
+                      Opens with: {OPENER_NAMES[aiDifficulty].join(', ')}
+                    </p>
+                  )}
+                </div>
+
+                <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-2 py-1.5">
+                  <div className="flex justify-between text-[11px]">
+                    <span className="text-slate-500">AI plan</span>
+                    <span className="text-cyan-400 font-mono truncate ml-2 max-w-[9rem] text-right">
+                      {aiStrategy?.label || 'thinking'}
+                    </span>
+                  </div>
                 </div>
 
                 <div>
@@ -2141,6 +2101,12 @@ export default function App() {
         {/* Player 2 (AI) Area */}
         <div className="flex gap-4">
           <div className="flex flex-col gap-4">
+            <div className="bg-slate-900 p-4 rounded-2xl border border-slate-800 shadow-xl w-32 flex flex-col items-center">
+              <h3 className="text-slate-400 text-sm font-semibold uppercase tracking-wider mb-2 text-center">Hold</h3>
+              <div className="h-16 flex items-center justify-center">
+                {aiHold ? <MiniPiece typeId={aiHold} disabled={!aiCanHoldRef.current} /> : <span className="text-slate-600 text-sm">Empty</span>}
+              </div>
+            </div>
             <div className="bg-slate-900 p-4 rounded-2xl border border-slate-800 shadow-xl w-32 flex flex-col items-center">
               <h3 className="text-slate-400 text-sm font-semibold uppercase tracking-wider mb-4 text-center">Next</h3>
               <div className="flex flex-col gap-6">
